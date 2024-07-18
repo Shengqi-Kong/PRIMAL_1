@@ -8,7 +8,7 @@ import time
 from od_mstar3.col_set_addition import OutOfTimeError,NoSolutionError
 
 results_path="primal_results"
-environment_path="saved_environments"
+environment_path= "saved_environments"
 if not os.path.exists(results_path):
     os.makedirs(results_path)
 

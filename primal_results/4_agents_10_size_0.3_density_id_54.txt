@@ -1,0 +1,1 @@
+{"finished": true, "time": 0.35070252418518066, "crashed": false, "length": 20}
