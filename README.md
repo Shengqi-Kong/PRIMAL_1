@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 # PRIMAL_1:New Repo
 # PRIMAL: Pathfinding via Reinforcement and Imitation Multi-Agent Learning
@@ -71,3 +72,7 @@ Hotkeys:
 [Justin Kerr](jgkerr@andrew.cmu.edu)
 
 
+=======
+# PRIMAL_1
+This is PRIMAL_1 repo
+>>>>>>> e76d42af6783996685e187ffc547e9905f1f8a8b
