@@ -270,6 +270,8 @@ class Worker:
                         continue
                     continue
                 saveGIF = False
+
+
                 if OUTPUT_GIFS and self.workerID == 1 and ((not TRAINING) or (episode_count >= self.nextGIF)):
                     saveGIF = True
                     self.nextGIF = episode_count + 64
@@ -535,8 +537,7 @@ swarm_reward           = [0]*NUM_META_AGENTS
 
 # 2024-07-18 15:02:06 下面是训练的部分。有关A3C算法的实现，是需要再单独看一下。
 
-
-
+# 2024-07-24 22:26:28 上面的部分基本代码是写出来了，接下来就是要继续写逻辑。
 
 tf.reset_default_graph()
 print("Hello World")

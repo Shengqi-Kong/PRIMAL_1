@@ -11,6 +11,8 @@ import random
 import torch
 import torch.nn
 import torch.nn.functional as F
+import torch.optim as optim
+import torch.multiprocessing as mp
 
 import matliblib.pyplot as plt
 import cpp_mstar
@@ -205,7 +207,7 @@ class Worker:
             state_in[1] = rnn_state0[1]
 
             # initialize the hidden  variable
-            hidden = net.init_hidden(1)
+            hidden = self.local_AC.init_hidden(1)
 
             # local_AC算法的输出数值
             policy, value, (hx, cx), blocking, on_goal,valids = self.local_AC(inputs,goal_pos,hidden)
@@ -259,7 +261,7 @@ class Worker:
         state_in[1] = rnn_state0[1]
 
         # initialize the hidden  variable
-        hidden = net.init_hidden(1)
+        hidden = self.local_AC.init_hidden(1)
 
         # 网络进行输出
         policy, value, (hx, cx), blocking, on_goal,valids = self.local_AC(inputs, goal_pos, hidden)
@@ -285,7 +287,7 @@ class Worker:
         policy_loss = -torch.sum(log_outputs * self.advantages)
 
         #valid_loss
-        train_valids = torch.tensor(train_valids, dtype=torch.float32)
+        train_valid = torch.tensor(train_valid, dtype=torch.float32)
         valids = torch.tensor(valids, dtype=torch.float32)
         clipped_valids = torch.clamp(valids, min=1e-10, max=1.0)
         clipped_one_minus_valids = torch.clamp(1 - valids, min=1e-10, max=1.0)
@@ -303,7 +305,7 @@ class Worker:
         entropy_loss = -torch.sum(self.policy * log_policy)
 
         # blocking_loss
-        target_blocking = torch.tensor(target_blockings, dtype=torch.float32)
+        target_blocking = torch.tensor(target_blocking, dtype=torch.float32)
         blocking = torch.tensor(blocking, dtype=torch.float32)
         clipped_blocking = torch.clamp(blocking, min=1e-10, max=1.0)
         clipped_one_minus_blocking = torch.clamp(1 - blocking, min=1e-10, max=1.0)
@@ -313,12 +315,12 @@ class Worker:
 
         # 计算损失
         blocking_loss = -torch.sum(
-            target_blockings * log_blocking +
-            (1 - target_blockings) * log_one_minus_blocking
+            target_blocking * log_blocking +
+            (1 - target_blocking) * log_one_minus_blocking
         )
 
         # on_goal_loss
-        target_on_goal = torch.tensor(target_on_goals, dtype=torch.float32)
+        target_on_goal = torch.tensor(target_on_goal, dtype=torch.float32)
         on_goal = torch.tensor(on_goal, dtype=torch.float32)
         clipped_on_goal = torch.clamp(on_goal, min=1e-10, max=1.0)
         clipped_one_minus_on_goal = torch.clamp(1 - on_goal, min=1e-10, max=1.0)
@@ -329,12 +331,373 @@ class Worker:
 
         # 计算损失
         on_goal_loss = -torch.sum(
-            target_on_goals * log_on_goal +
-            (1 - target_on_goals) * log_one_minus_on_goal
+            target_on_goal * log_on_goal +
+            (1 - target_on_goal) * log_one_minus_on_goal
         )
 
         return value_loss/len(rollout), policy_loss/len(rollout), valid_loss/len(
             rollout),entropy_loss/len(rollout),blocking_loss/len(rollout),on_goal_loss/len(rollout)
 
+    def pull_global(self, global_AC, local_AC):
+        # 将全局参数更新到本地模型中
+        for global_param, local_param in zip(global_AC.parameters(), local_AC.parameters()):
+            local_param.data.copy_(global_param.data)
 
     def work(self, max_episode_length, gamma):
+        global episode_count, swarm_reward, \
+            episode_rewards, episode_lengths, \
+            episode_mean_values, episode_invalid_ops, \
+            episode_wrong_blocking  # , episode_invalid_goals
+        total_steps, i_buf = 0, 0
+        episode_buffers, s1Values = [[] for _ in range(NUM_BUFFERS)], [[] for _ in range(NUM_BUFFERS)]
+
+        while(self.shouldRun(episode_count)):
+            # 把global网络的参数pull到local网络中
+            self.local_AC.load_state_dict(self.global_AC.state_dict())
+            episode_buffer, episode_values = [], []
+            episode_reward = episode_step_count = episode_inv_count = 0
+            d = False
+
+            # Initial state from the environment
+            if self.agentID == 1:
+                self.env._reset(self.agentID)
+            self.synchronize()  # synchronize starting time of the threads
+            validActions = self.env._listNextValidActions(self.agentID)
+            s = self.env._observe(self.agentID)
+            blocking = False
+            p = self.env.world.getPos(self.agentID)
+
+
+            on_goal = self.env.world.goals[p[0], p[1]] == self.agentID
+            s = self.env._observe(self.agentID)
+            rnn_state = self.local_AC.state_init
+            rnn_state0 = rnn_state
+            RewardNb = 0
+            wrong_blocking = 0
+            wrong_on_goal = 0
+
+            if self.agentID == 1:
+                global demon_probs
+                demon_probs[self.metaAgentID] = np.random.rand()
+            self.synchronize()  # synchronize starting time of the threads
+
+
+            # reset swarm_reward (for tensorboard)
+            swarm_reward[self.metaAgentID] = 0
+            if episode_count < PRIMING_LENGTH or demon_probs[self.metaAgentID] < DEMONSTRATION_PROB:
+                # for the first PRIMING_LENGTH episodes, or with a certain probability
+                # don't train on the episode and instead observe a demonstration from M*
+                if self.workerID == 1 and episode_count % 100 == 0:
+                    # saver.save(sess, model_path + '/model-' + str(int(episode_count)) + '.cptk')
+                    torch.save(self.global_AC.state_dict(), f'{model_path}/model-{int(episode_count)}.pt')
+                global rollouts
+                rollouts[self.metaAgentID] = None
+                if (self.agentID == 1):
+                    world = self.env.getObstacleMap()
+                    start_positions = tuple(self.env.getPositions())
+                    goals = tuple(self.env.getGoals())
+                    try:
+                        mstar_path = cpp_mstar.find_path(world, start_positions, goals, 2, 5)
+                        rollouts[self.metaAgentID] = self.parse_path(mstar_path)
+                    except OutOfTimeError:
+                        # M* timed out
+                        print("timeout", episode_count)
+                    except NoSolutionError:
+                        print("nosol????", episode_count, start_positions)
+                self.synchronize()
+                if rollouts[self.metaAgentID] is not None:
+                    imitation_loss = self.train(rollouts[self.metaAgentID][self.agentID - 1], gamma, None, rnn_state0,
+                                     imitation=True)
+                    episode_count += 1. / num_workers
+                    # if self.agentID == 1:
+                        # summary = tf.Summary()
+                        # summary.value.add(tag='Losses/Imitation loss', simple_value=i_l)
+                        # global_summary.add_summary(summary, int(episode_count))
+                        # global_summary.flush()
+                    # TODO 这里应该对imitation_loss的进行反向传播，第一个问题，A3C算法是隔一段时间
+                    # 把local的parameters更新到global，还是把local的梯度更新到global？
+
+                    # 如果是local梯度来更新global，torch中是如何实现的？
+
+                    continue
+                continue
+            saveGIF = False
+
+            if OUTPUT_GIFS and self.workerID == 1 and ((not TRAINING) or (episode_count >= self.nextGIF)):
+                saveGIF = True
+                self.nextGIF = episode_count + 64
+                GIF_episode = int(episode_count)
+                episode_frames = [self.env._render(mode='rgb_array', screen_height=900, screen_width=900)]
+
+            while(not self.env.finished):
+
+                inputs = [s[0]]
+                goal_pos = [s[1]]
+                state_in = [[] for i in range(2)]
+                state_in[0] = rnn_state0[0]
+                state_in[1] = rnn_state0[1]
+                hidden = self.local_AC.init_hidden(1)
+
+                a_dist, v, rnn_state, pred_blocking, pred_on_goal,_ = self.local_AC(inputs,goal_pos,hidden)
+
+                if (not (np.argmax(a_dist.flatten()) in validActions)):
+                    episode_inv_count += 1
+                train_valid = np.zeros(a_size)
+                train_valid[validActions] = 1
+
+                valid_dist = np.array([a_dist[0, validActions]])
+                valid_dist /= np.sum(valid_dist)
+
+                if TRAINING:
+                    if (pred_blocking.flatten()[0] < 0.5) == blocking:
+                        wrong_blocking += 1
+                    if (pred_on_goal.flatten()[0] < 0.5) == on_goal:
+                        wrong_on_goal += 1
+                    a = validActions[np.random.choice(range(valid_dist.shape[1]), p=valid_dist.ravel())]
+                    train_val = 1.
+                else:
+                    a = np.argmax(a_dist.flatten())
+                    if a not in validActions or not GREEDY:
+                        a = validActions[np.random.choice(range(valid_dist.shape[1]), p=valid_dist.ravel())]
+                    train_val = 1.
+
+                _, r, _, _, on_goal, blocking, _ = self.env._step((self.agentID, a), episode=episode_count)
+                self.synchronize()  # synchronize threads
+                # Get common observation for all agents after all individual actions have been performed
+                s1 = self.env._observe(self.agentID)
+                validActions = self.env._listNextValidActions(self.agentID, a, episode=episode_count)
+                d = self.env.finished
+
+                if saveGIF:
+                    episode_frames.append(self.env._render(mode='rgb_array', screen_width=900, screen_height=900))
+
+                episode_buffer.append(
+                    [s[0], a, r, s1, d, v[0, 0], train_valid, pred_on_goal, int(on_goal), pred_blocking,
+                     int(blocking), s[1], train_val])
+                episode_values.append(v[0, 0])
+                episode_reward += r
+                s = s1
+                total_steps += 1
+                episode_step_count += 1
+
+                if r > 0:
+                    RewardNb += 1
+                if d == True:
+                    print('\n{} Goodbye World. We did it!'.format(episode_step_count), end='\n')
+
+                if TRAINING and (len(episode_buffer) % EXPERIENCE_BUFFER_SIZE == 0 or d):
+                    # Since we don't know what the true final return is, we "bootstrap" from our current value estimation.
+                    if len(episode_buffer) >= EXPERIENCE_BUFFER_SIZE:
+                        episode_buffers[i_buf] = episode_buffer[-EXPERIENCE_BUFFER_SIZE:]
+                    else:
+                        episode_buffers[i_buf] = episode_buffer[:]
+
+                    if d:
+                        s1Values[i_buf] = 0
+                    else:
+                        hidden = self.local_AC.init_hidden(1)
+                        _,s1Values[i_buf], _,_,_,_ = self.local_AC(torch.tensor(np.array([s[0]])),\
+                                                                   torch.tensor([s[1]]),
+                                                                   hidden
+                                                                   )
+                    if (episode_count - EPISODE_START) < NUM_BUFFERS:
+                        i_rand = np.random.randint(i_buf + 1)
+                    else:
+                        i_rand = np.random.randint(NUM_BUFFERS)
+                        tmp = np.array(episode_buffers[i_rand])
+                        while tmp.shape[0] == 0:
+                            i_rand = np.random.randint(NUM_BUFFERS)
+                            tmp = np.array(episode_buffers[i_rand])
+
+                    v_l,p_l, valid_l,e_l,b_l,og_l = self.train(episode_buffers[i_rand],gamma,s1Values[i_rand],rnn_state0)
+                    i_buf = (i_buf + 1) % NUM_BUFFERS
+                    rnn_state0 = rnn_state
+                    episode_buffers[i_buf] = []
+                self.synchronize()  # synchronize threads
+                # sess.run(self.pull_global)
+                if episode_step_count >= max_episode_length or d:
+                    break
+
+            episode_lengths[self.metaAgentID].append(episode_step_count)
+            episode_mean_values[self.metaAgentID].append(np.nanmean(episode_values))
+            episode_invalid_ops[self.metaAgentID].append(episode_inv_count)
+            episode_wrong_blocking[self.metaAgentID].append(wrong_blocking)
+
+            # Periodically save gifs of episodes, model parameters, and summary statistics.
+            if episode_count % EXPERIENCE_BUFFER_SIZE == 0 and printQ:
+                print('                                                                                   ',
+                      end='\r')
+                print('{} Episode terminated ({},{})'.format(episode_count, self.agentID, RewardNb), end='\r')
+
+            swarm_reward[self.metaAgentID] += episode_reward
+            self.synchronize()  # synchronize threads
+
+            episode_rewards[self.metaAgentID].append(swarm_reward[self.metaAgentID])
+
+            if not TRAINING:
+                mutex.acquire()
+                if episode_count < NUM_EXPS:
+                    plan_durations[episode_count] = episode_step_count
+                if self.workerID == 1:
+                    episode_count += 1
+                    print('({}) Thread {}: {} steps, {:.2f} reward ({} invalids).'.format(episode_count,
+                                                                                          self.workerID,
+                                                                                          episode_step_count,
+                                                                                          episode_reward,
+                                                                                          episode_inv_count))
+                GIF_episode = int(episode_count)
+                mutex.release()
+            else:
+                episode_count += 1. / num_workers
+
+                if episode_count % SUMMARY_WINDOW == 0:
+                    if episode_count % 100 == 0:
+                        print('Saving Model', end='\n')
+                        torch.save(self.global_AC.state_dict(), f'{model_path}/model-{int(episode_count)}.pt')
+                        # saver.save(sess, model_path + '/model-' + str(int(episode_count)) + '.cptk')
+                        print('Saved Model', end='\n')
+                    SL = SUMMARY_WINDOW * num_workers
+                    mean_reward = np.nanmean(episode_rewards[self.metaAgentID][-SL:])
+                    mean_length = np.nanmean(episode_lengths[self.metaAgentID][-SL:])
+                    mean_value = np.nanmean(episode_mean_values[self.metaAgentID][-SL:])
+                    mean_invalid = np.nanmean(episode_invalid_ops[self.metaAgentID][-SL:])
+                    mean_wrong_blocking = np.nanmean(episode_wrong_blocking[self.metaAgentID][-SL:])
+                    # current_learning_rate = sess.run(lr, feed_dict={global_step: episode_count})
+
+                    # if True:
+                    #     summary = tf.Summary()
+                    #     summary.value.add(tag='Perf/Learning Rate', simple_value=current_learning_rate)
+                    #     summary.value.add(tag='Perf/Reward', simple_value=mean_reward)
+                    #     summary.value.add(tag='Perf/Length', simple_value=mean_length)
+                    #     summary.value.add(tag='Perf/Valid Rate',
+                    #                       simple_value=(mean_length - mean_invalid) / mean_length)
+                    #     summary.value.add(tag='Perf/Blocking Prediction Accuracy',
+                    #                       simple_value=(mean_length - mean_wrong_blocking) / mean_length)
+                    #
+                    #     summary.value.add(tag='Losses/Value Loss', simple_value=v_l)
+                    #     summary.value.add(tag='Losses/Policy Loss', simple_value=p_l)
+                    #     summary.value.add(tag='Losses/Blocking Loss', simple_value=b_l)
+                    #     summary.value.add(tag='Losses/On Goal Loss', simple_value=og_l)
+                    #     summary.value.add(tag='Losses/Valid Loss', simple_value=valid_l)
+                    #     summary.value.add(tag='Losses/Grad Norm', simple_value=g_n)
+                    #     summary.value.add(tag='Losses/Var Norm', simple_value=v_n)
+                    #     global_summary.add_summary(summary, int(episode_count))
+                    #
+                    #     global_summary.flush()
+
+                    if printQ:
+                        print('{} Tensorboard updated ({})'.format(episode_count, self.workerID), end='\r')
+            # if saveGIF:
+            #     # Dump episode frames for external gif generation (otherwise, makes the jupyter kernel crash)
+            #     time_per_step = 0.1
+            #     images = np.array(episode_frames)
+            #     if TRAINING:
+            #         make_gif(images,
+            #                  '{}/episode_{:d}_{:d}_{:.1f}.gif'.format(gifs_path, GIF_episode, episode_step_count,
+            #                                                           swarm_reward[self.metaAgentID]))
+            #     else:
+            #         make_gif(images, '{}/episode_{:d}_{:d}.gif'.format(gifs_path, GIF_episode, episode_step_count),
+            #                  duration=len(images) * time_per_step, true_image=True, salience=False)
+            # if SAVE_EPISODE_BUFFER:
+            #     with open('gifs3D/episode_{}.dat'.format(GIF_episode), 'wb') as file:
+            #         pickle.dump(episode_buffer, file)
+
+
+
+# Training Part
+print("Hello World")
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+
+
+if not TRAINING:
+    plan_durations = np.array([0 for _ in range(NUM_EXPS)])
+    mutex = threading.Lock()
+    gifs_path += '_tests'
+    if SAVE_EPISODE_BUFFER and not os.path.exists('gifs3D'):
+        os.makedirs('gifs3D')
+
+# Create a directory to save episode playback gifs to
+if not os.path.exists(gifs_path):
+    os.makedirs(gifs_path)
+
+
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# TODO
+global_network = ActorCritic(a_size,True)
+lr = 0.001
+
+optimizer = optim.Adam(global_network.parameters(),lr)
+
+if TRAINING:
+    num_workers = NUM_THREADS  # Set workers # = # of available CPU threads
+else:
+    num_workers = NUM_THREADS
+    NUM_META_AGENTS = 1
+
+gameEnvs, workers, groupLocks = [], [], []
+n = 1  # counter of total number of agents (for naming)
+for ma in range(NUM_META_AGENTS):
+    num_agents = NUM_THREADS
+    gameEnv = mapf_gym.MAPFEnv(num_agents=num_agents, DIAGONAL_MOVEMENT=DIAG_MVMT, SIZE=ENVIRONMENT_SIZE,
+                               observation_size=GRID_SIZE, PROB=OBSTACLE_DENSITY, FULL_HELP=FULL_HELP)
+    gameEnvs.append(gameEnv)
+
+    # Create groupLock
+    workerNames = ["worker_" + str(i) for i in range(n, n + num_workers)]
+    groupLock = GroupLock.GroupLock([workerNames, workerNames])
+    groupLocks.append(groupLock)
+
+    # Create worker classes
+    workersTmp = []
+    for i in range(ma * num_workers + 1, (ma + 1) * num_workers + 1):
+        workersTmp.append(Worker(gameEnv, ma, n, a_size, groupLock))
+        n += 1
+    workers.append(workersTmp)
+
+if load_model == True:
+    print('Loading Model...')
+    if not TRAINING:
+        # 创建检查点文件
+        with open(os.path.join(model_path, 'checkpoint'), 'w') as file:
+            file.write(f'model_checkpoint_path: "model-{int(episode_count)}.pt"')
+            file.close()
+        # 获取检查点文件路径
+    checkpoint_path = os.path.join(model_path, f'model-{int(episode_count)}.pt')
+
+    # 检查文件是否存在
+    if os.path.isfile(checkpoint_path):
+        # 加载模型权重
+        global_network.load_state_dict(torch.load(checkpoint_path))
+        print(f"Model loaded from {checkpoint_path}")
+
+        # 提取模型编号
+        p = os.path.basename(checkpoint_path)
+        p = p[p.find('-') + 1:]
+        p = p[:p.find('.')]
+        episode_count = int(p)
+        print("episode_count set to ", episode_count)
+    else:
+        print("No checkpoint found at", checkpoint_path)
+    if RESET_TRAINER:
+        optimizer = optim.Adam(global_network.parameters(), lr=lr)
+
+worker_threads = []
+
+for ma in range(NUM_META_AGENTS):
+    for worker in workers[ma]:
+        groupLocks[ma].acquire(0, worker.name)  # synchronize starting time of the threads
+        worker_work = lambda: worker.work(max_episode_length, gamma)
+        p = mp.Process(target=worker_work, args=(max_episode_length, gamma))
+        p.start()
+        worker_threads.append(p)
+
+for p in worker_threads:
+    p.join()
+
+
+

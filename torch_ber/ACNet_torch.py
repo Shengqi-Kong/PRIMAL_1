@@ -118,7 +118,7 @@ class ActorCritic(nn.Module):
         # valids? the writter called rhe policy_sig the valids and returned it.
         policy_sig = F.sigmoid(self.policy_linear(rnn_out),dim=1)
 
-        return policy, value, (hx, cx), blocking, on_goal,policy_sig
+        return policy, value, (cx, hx), blocking, on_goal,policy_sig
 
     def init_hidden(self, batch_size):
         return (torch.zeros(batch_size, RNN_SIZE), torch.zeros(batch_size, RNN_SIZE))
