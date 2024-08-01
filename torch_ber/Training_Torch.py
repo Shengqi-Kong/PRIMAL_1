@@ -9,7 +9,7 @@ import numpy as np
 import random
 
 import torch
-import torch.nn
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.multiprocessing as mp
@@ -84,6 +84,12 @@ SUMMARY_WINDOW         = 10
 
 NUM_META_AGENTS        = 2
 NUM_THREADS            = 3 #int(multiprocessing.cpu_count() / (2 * NUM_META_AGENTS))
+
+# 2024-08-01 23:15:44 假设如果不涉及线程同步，即A2C
+#
+# NUM_META_AGENTS        = 1
+# NUM_THREADS            = 1
+
 NUM_BUFFERS            = 1 # NO EXPERIENCE REPLAY int(NUM_THREADS / 2)
 EPISODE_SAMPLES        = EXPERIENCE_BUFFER_SIZE # 64
 LR_Q                   = 2.e-5 #8.e-5 / NUM_THREADS # default: 1e-5
@@ -131,19 +137,25 @@ Worker: worker thread.
 # TODO understand how the worker thread works
 class Worker:
 
-    def __init__(self,game,metaAgentID,workerID,a_size,groupLock):
+    # def __init__(self, game, metaAgentID, workerID, a_size, groupLock):
+    #
+    def __init__(self, game, metaAgentID, workerID, a_size, groupLock,global_network,optimizer):
+
         self.env = game
         self.metaAgentID = metaAgentID
         self.workerID = workerID
         self.name = "worker_"+str(workerID)
         self.agentID = ((workerID-1) % num_workers) + 1
         self.groupLock = groupLock
-
+        self.optimizer = optimizer
         # self.nextGIF = episode_count  # For GIFs output
         # Create the local copy of the network and the tensorflow op to copy global parameters to local network
         # TODO
         #  这里local_AC 是一个本地的网络，与global的网络要进行区分开。
-        self.global_AC = ActorCritic(a_size,TRAINING)
+        # self.global_AC = ActorCritic(a_size,TRAINING)
+
+        # 2024-08-01 21:48:14
+        self.global_AC = global_network
         self.local_AC =ActorCritic(a_size,TRAINING)
 
     # 判断是否应该继续跑下去
@@ -269,12 +281,18 @@ class Worker:
         # 对需要计算损失的变量进行tensor化，并计算损失
 
         # value_loss
+        # 2024-08-01 22:20:28 value_loss应该用现成的误差函数来计算，否则看起来不太对。
+        # TODO train_value是用来干什么的？
+        # criterion = nn.MSEloss()
+
         train_value = torch.tensor(train_value, dtype=torch.float32)
         target_v    = torch.tensor(target_v, dtype=torch.float32)
-        reshaped_value = self.value.view(-1)  # 等价于 tf.reshape(self.value, shape=[-1])
-        squared_diff = torch.square(self.target_v - reshaped_value)  # 等价于 tf.square(self.target_v - reshaped_value)
+        # reshaped_value = value.view(-1)  # 等价于 tf.reshape(self.value, shape=[-1])
+        # squared_diff = torch.square(self.target_v - reshaped_value)  # 等价于 tf.square(self.target_v - reshaped_value)
 
-        value_loss = torch.sum(self.train_value * squared_diff)  # 等价于 tf.reduce_sum(self.train_value * squared_diff)
+        # value_loss = torch.sum(self.train_value * squared_diff)  # 等价于 tf.reduce_sum(self.train_value * squared_diff)
+        value_loss = F.mse_loss(value.view(-1), target_v)
+
 
         # policy_loss
         actions = torch.tensor(actions, dtype=torch.int64)
@@ -409,6 +427,9 @@ class Worker:
                     imitation_loss = self.train(rollouts[self.metaAgentID][self.agentID - 1], gamma, None, rnn_state0,
                                      imitation=True)
                     episode_count += 1. / num_workers
+                    self.optimizer.zero_grad()
+                    imitation_loss.backward()
+                    self.optimizer.step()
                     # if self.agentID == 1:
                         # summary = tf.Summary()
                         # summary.value.add(tag='Losses/Imitation loss', simple_value=i_l)
@@ -510,6 +531,11 @@ class Worker:
                             tmp = np.array(episode_buffers[i_rand])
 
                     v_l,p_l, valid_l,e_l,b_l,og_l = self.train(episode_buffers[i_rand],gamma,s1Values[i_rand],rnn_state0)
+                    total_loss = 0.5 * v_l + p_l + 0.5 * valid_l - 0.01 * e_l + 0.5 * b_l + 0.5 * og_l
+                    self.optimizer.zero_grad()
+                    total_loss.backward()
+                    self.optimizer.step()
+
                     i_buf = (i_buf + 1) % NUM_BUFFERS
                     rnn_state0 = rnn_state
                     episode_buffers[i_buf] = []
@@ -627,7 +653,8 @@ if not os.path.exists(gifs_path):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# TODO
+# TODO  这里global-network是怎么和local_network进行协调的？
+
 global_network = ActorCritic(a_size,True)
 lr = 0.001
 
@@ -683,8 +710,8 @@ if load_model == True:
         print("episode_count set to ", episode_count)
     else:
         print("No checkpoint found at", checkpoint_path)
-    if RESET_TRAINER:
-        optimizer = optim.Adam(global_network.parameters(), lr=lr)
+    # if RESET_TRAINER:
+    #     optimizer = optim.Adam(global_network.parameters(), lr=lr)
 
 worker_threads = []
 

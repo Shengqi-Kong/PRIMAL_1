@@ -89,3 +89,5 @@ auto/
 ###################
 __pycache__/
 results/
+/torch_ber/goodtest.ipynb
+/torch_ber/learnTorch.py
