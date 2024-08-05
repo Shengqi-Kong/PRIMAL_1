@@ -94,12 +94,21 @@ class ACNet:
         d2 = layers.dropout(h2, keep_prob=KEEP_PROB2, is_training=TRAINING)
         self.h3 = tf.nn.relu(d2+hidden_input)
         #Recurrent network for temporal dependencies
+
+        # 下面这段的tensorflow代码，感觉疑惑的点有点多，主要是对state_out还有rnn_out这里输出
+        # 做出的变换是什么作用？
+
         lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(RNN_SIZE,state_is_tuple=True)
+
+        # 2024-08-03 11:17:12 TODO 这里为什么要把state_init和state_in区分改呢？
         c_init = np.zeros((1, lstm_cell.state_size.c), np.float32)
         h_init = np.zeros((1, lstm_cell.state_size.h), np.float32)
         state_init = [c_init, h_init]
+
+
         c_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.c])
         h_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.h])
+        # 这里的state_in是需要进行优化的参数，因为上面对这俩参数进行了占位。
         state_in = (c_in, h_in)
         rnn_in = tf.expand_dims(self.h3, [0])
         step_size = tf.shape(inputs)[:1]

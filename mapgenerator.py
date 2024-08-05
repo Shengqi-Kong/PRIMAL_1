@@ -44,6 +44,7 @@ def init(data):
     if DYNAMIC_TESTING:
         data.rnn_states=[]
         data.sess=tf.Session()
+        # 2024-08-03 11:12:19 如果采用pytorch的方法，这里的网络结构也需要改
         data.network=ACNet("global",5,None,False,10,"global")
         #load the weights from the checkpoint (only the global ones!)
         ckpt = tf.train.get_checkpoint_state(model_path)
