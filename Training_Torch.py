@@ -50,7 +50,7 @@ if torch.cuda.is_available():
 else:
     print("\nCUDA is not available")
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = 'cuda'
+device = 'cpu'
 print(device)
 
 # 暂时不写gif代码
